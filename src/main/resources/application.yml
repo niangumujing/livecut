@@ -1,0 +1,21 @@
+server:
+  port: 7071
+
+minio:
+  endpoint: http://localhost:9000
+  access-key: minioadmin
+  secret-key: minioadmin
+  bucket-name: livecut
+
+recorder:
+  output-dir: /tmp/livecut
+  live-url: https://live.douyin.com/252280097841
+  check-interval: 30
+
+toWechat:
+  app:
+    appId: wxfd********3e9ff
+    appSecret: wxf********5c483e9ff
+    encodingAESKey: f6Fn5********pyCxLPwR753QWy9RfkZCadWB7EvY8pO0W
+    token: nian********ujing
+    defaultMaxChars: 400
