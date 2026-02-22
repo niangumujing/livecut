@@ -8,4 +8,5 @@ import lombok.Data;
 public class AliyunBaiLian implements BaseAi{
     private String accessKeyId;
     private String model;
+
 }
