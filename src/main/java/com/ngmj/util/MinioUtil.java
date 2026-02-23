@@ -33,6 +33,11 @@ public class MinioUtil {
             String url = minioConfig.getEndpoint() + "/" + 
                          minioConfig.getBucketName() + "/" + objectName;
             log.info("上传成功: {}", url);
+            
+            if (file.delete()) {
+                log.info("已删除本地文件: {}", file.getAbsolutePath());
+            }
+            
             return url;
             
         } catch (Exception e) {

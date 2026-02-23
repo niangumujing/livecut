@@ -16,6 +16,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 @Service
@@ -26,12 +27,23 @@ public class LiveRecorder {
     private final AtomicBoolean monitoring = new AtomicBoolean(false);
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final MinioUtil minioUtil;
+    private final WhisperService whisperService;
+    private final AtomicInteger failCount = new AtomicInteger(0);
 
     @Getter
     private String currentOutputPath;
 
     @Getter
+    private String currentBatchName;
+
+    @Getter
     private String currentMinioUrl;
+
+    @Getter
+    private String currentSrtUrl;
+
+    @Getter
+    private String currentTranscriptText;
 
     @Value("${recorder.output-dir:/tmp/livecut}")
     private String outputDir;
@@ -42,8 +54,15 @@ public class LiveRecorder {
     @Value("${recorder.check-interval:30}")
     private int checkInterval;
 
-    public LiveRecorder(MinioUtil minioUtil) {
+    @Value("${recorder.max-fail-count:3}")
+    private int maxFailCount;
+
+    @Value("${bark.url:http://www.ggsuper.com.cn/push/api/v1/sendMsg_New.php?token=niangumujin}")
+    private String barkUrl;
+
+    public LiveRecorder(MinioUtil minioUtil, WhisperService whisperService) {
         this.minioUtil = minioUtil;
+        this.whisperService = whisperService;
     }
 
     public synchronized String startMonitoring() {
@@ -55,21 +74,32 @@ public class LiveRecorder {
         }
 
         monitoring.set(true);
+        failCount.set(0);
+        
         executor.submit(() -> {
             log.info("开始监听直播间: {}", liveUrl);
+            log.info("最大失败次数: {}", maxFailCount);
+            
             while (monitoring.get()) {
                 try {
-                    boolean isLiving = checkLiveStatus();
-                    log.info("直播间状态: {}", isLiving ? "直播中" : "未开播");
+                    boolean isLiving = checkLiveStatusWithRetry();
+                    log.info("直播间状态: {} {}", isLiving ? "直播中" : "未开播", 
+                            failCount.get() > 0 ? "(失败次数: " + failCount.get() + ")" : "");
 
                     if (isLiving && !recording.get()) {
                         String streamUrl = getStreamUrl();
                         if (streamUrl != null) {
                             doStartRecording(streamUrl);
                         }
+                        failCount.set(0);
                     } else if (!isLiving && recording.get()) {
-                        log.info("直播间已关闭，停止录制");
-                        doStopRecording();
+                        if (failCount.get() >= maxFailCount) {
+                            log.info("连续{}次检测失败，停止录制", failCount.get());
+                            doStopRecording();
+                            failCount.set(0);
+                        } else {
+                            log.warn("检测失败，继续录制等待恢复... ({}/{})", failCount.get(), maxFailCount);
+                        }
                     }
 
                     Thread.sleep(checkInterval * 1000L);
@@ -84,6 +114,11 @@ public class LiveRecorder {
                     }
                 }
             }
+            
+            if (recording.get()) {
+                log.info("监听停止，保存当前录制");
+                doStopRecording();
+            }
             log.info("监听已停止");
         });
 
@@ -91,21 +126,62 @@ public class LiveRecorder {
     }
 
     public synchronized String stopMonitoring() {
+        if (!monitoring.get()) {
+            return "当前没有监听任务";
+        }
+        
         monitoring.set(false);
         if (recording.get()) {
             doStopRecording();
             return "已停止监听和录制";
         }
-        return "已停止监听";
+        return "未开播，停止等待";
     }
 
     public synchronized String forceStop() {
+        if (!monitoring.get()) {
+            return "当前没有任务";
+        }
+        
         monitoring.set(false);
         if (recording.get()) {
             doStopRecording();
             return "已强制停止录制";
         }
-        return "当前没有录制任务";
+        return "未开播，停止等待";
+    }
+
+    private boolean checkLiveStatusWithRetry() {
+        for (int i = 0; i < 3; i++) {
+            try {
+                HttpResponse response = HttpRequest.get(liveUrl)
+                        .timeout(15000)
+                        .execute();
+                String body = response.body();
+                boolean isLiving = body.contains("live/stream") || 
+                        body.contains("flv") || 
+                        body.contains("m3u8") ||
+                        body.contains("\"live_status\":1");
+                
+                if (isLiving) {
+                    failCount.set(0);
+                    return true;
+                }
+                return false;
+            } catch (Exception e) {
+                log.warn("检查直播状态失败(尝试{}/3): {}", i + 1, e.getMessage());
+                if (i < 2) {
+                    try {
+                        Thread.sleep(2000);
+                    } catch (InterruptedException ie) {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        failCount.incrementAndGet();
+        return false;
     }
 
     private boolean checkLiveStatus() {
@@ -127,7 +203,7 @@ public class LiveRecorder {
     private String getStreamUrl() {
         try {
             HttpResponse response = HttpRequest.get(liveUrl)
-                    .timeout(10000)
+                    .timeout(15000)
                     .execute();
             String body = response.body();
             log.info("页面内容长度: {}", body.length());
@@ -155,13 +231,18 @@ public class LiveRecorder {
 
     private void doStartRecording(String streamUrl) {
         try {
-            File dir = new File(outputDir);
+            LocalDateTime now = LocalDateTime.now();
+            String dateStr = now.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            String timeStr = now.format(DateTimeFormatter.ofPattern("HHmmss"));
+            currentBatchName = dateStr + "/live_" + timeStr;
+            
+            String batchDir = outputDir + "/" + currentBatchName;
+            currentOutputPath = batchDir + "/audio.mp3";
+            
+            File dir = new File(batchDir);
             if (!dir.exists()) {
                 dir.mkdirs();
             }
-
-            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
-            currentOutputPath = outputDir + "/live_" + timestamp + ".mp3";
 
             String[] command = {
                 "ffmpeg",
@@ -221,18 +302,75 @@ public class LiveRecorder {
 
             recording.set(false);
 
-            if (currentOutputPath != null) {
-                File outputFile = new File(currentOutputPath);
+            final String audioPath = currentOutputPath;
+            
+            if (audioPath != null) {
+                File outputFile = new File(audioPath);
                 if (outputFile.exists() && outputFile.length() > 0) {
-                    log.info("录制完成: {} ({})", currentOutputPath, formatSize(outputFile.length()));
+                    log.info("录制完成: {} ({})", audioPath, formatSize(outputFile.length()));
                     
-                    currentMinioUrl = minioUtil.upload(outputFile, "audio/" + outputFile.getName());
-                    log.info("已上传到MinIO: {}", currentMinioUrl);
+                    executor.submit(() -> processAudioAsync(audioPath));
+                } else {
+                    log.warn("录制文件不存在或为空: {}", audioPath);
+                    sendNotification("录制异常", "文件不存在或为空");
                 }
             }
 
         } catch (Exception e) {
             log.error("停止录制失败", e);
+            sendNotification("录制失败", e.getMessage());
+        }
+    }
+
+    private void processAudioAsync(String audioPath) {
+        try {
+            File outputFile = new File(audioPath);
+            if (!outputFile.exists()) {
+                log.error("音频文件不存在: {}", audioPath);
+                return;
+            }
+
+            log.info("开始语音转写...");
+            sendNotification("转写中", "正在将音频转为文字...");
+            
+            String batchName = currentBatchName;
+            WhisperService.TranscribeResult transcribeResult = whisperService.transcribe(audioPath, batchName);
+
+            currentMinioUrl = minioUtil.upload(outputFile, batchName + "/audio.mp3");
+            log.info("已上传音频到MinIO: {}", currentMinioUrl);
+            
+            if (transcribeResult.isSuccess()) {
+                currentSrtUrl = transcribeResult.getSrtMinioUrl();
+                currentTranscriptText = transcribeResult.getText();
+                
+                String msg = String.format("转写完成，共%d字", currentTranscriptText.length());
+                log.info(msg);
+                sendNotification("转写完成", msg + " " + currentSrtUrl);
+            } else {
+                log.error("转写失败: {}", transcribeResult.getMessage());
+                sendNotification("转写失败", transcribeResult.getMessage());
+            }
+        } catch (Exception e) {
+            log.error("处理音频失败", e);
+            sendNotification("处理失败", e.getMessage());
+        }
+    }
+
+    private void sendNotification(String title, String content) {
+        try {
+            String jsonBody = String.format(
+                "{\"title\":\"%s\",\"msg\":\"%s\",\"url\":\"%s\",\"token\":\"niangumujin\",\"issecure\":0,\"sender\":\"livecut\"}",
+                title, content, currentMinioUrl != null ? currentMinioUrl : ""
+            );
+            
+            HttpResponse response = HttpRequest.post(barkUrl)
+                    .header("Content-Type", "application/json")
+                    .body(jsonBody)
+                    .timeout(10000)
+                    .execute();
+            log.info("推送通知: {} - {}, 响应: {}", title, content, response.body());
+        } catch (Exception e) {
+            log.error("推送通知失败: {}", e.getMessage());
         }
     }
 

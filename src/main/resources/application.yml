@@ -9,8 +9,17 @@ minio:
 
 recorder:
   output-dir: /tmp/livecut
-  live-url: https://live.douyin.com/252280097841
+  live-url: https://live.douyin.com/863189302657
   check-interval: 30
+  max-fail-count: 3
+
+bark:
+  url: http://www.ggsuper.com.cn/push/api/v1/sendMsg3_New.php
+
+whisper:
+  command: whisper
+  model: base
+  output-dir: /tmp/livecut
 
 toWechat:
   app:
