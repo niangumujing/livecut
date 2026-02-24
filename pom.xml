@@ -86,6 +86,11 @@
             <scope>test</scope>
         </dependency>
 
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>dashscope-sdk-java</artifactId>
+            <version>2.22.9</version>
+        </dependency>
     </dependencies>
 
 </project>
